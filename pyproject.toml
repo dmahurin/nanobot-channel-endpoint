@@ -1,0 +1,12 @@
+[project]
+name = "nanobot-channel-endpoint"
+version = "0.1.0"
+description = "Endpoint channel plugin for nanobot"
+dependencies = ["flask[async]"]
+
+[project.entry-points."nanobot.channels"]
+endpoint = "nanobot_channel_endpoint:EndpointChannel"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
