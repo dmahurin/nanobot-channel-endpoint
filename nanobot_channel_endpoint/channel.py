@@ -11,6 +11,8 @@ from loguru import logger
 
 from pydantic import Field
 
+from functools import wraps
+
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
@@ -18,7 +20,8 @@ from nanobot.config.schema import Base
 
 class EndpointConfig(Base):
     enabled: bool = False
-    host: str = "0.0.0.0"
+    api_key: str = ""
+    host: str = "127.0.0.1"
     port: int = 8080
     allow_from: list[str] = Field(default_factory=lambda: ["*"])
 
@@ -51,6 +54,22 @@ class EndpointChannel(BaseChannel):
     def _setup_routes(self) -> None:
         """Register Flask routes."""
 
+        def require_api_key(f):
+            @wraps(f)
+            async def decorated(*args, **kwargs):
+                if self.config.api_key != "":
+                    auth = request.headers.get("Authorization", "")
+                    # Expect format: "Bearer <key>"
+                    if not auth.startswith("Bearer "):
+                        return jsonify({"error": "missing_authorization"}), 401
+                    token = auth.split(" ", 1)[1].strip()
+                    if not token:
+                        return jsonify({"error": "invalid_token"}), 401
+                    if token != self.config.api_key:
+                        return jsonify({"error": "invalid_api_key"}), 403
+                return await f(*args, **kwargs)
+            return decorated
+
         @self.app.after_request
         def add_cors_headers(response):
             response.headers.add('Access-Control-Allow-Origin', '*')
@@ -59,6 +78,7 @@ class EndpointChannel(BaseChannel):
             return response
 
         @self.app.route("/v1/responses", methods=["POST"])
+        @require_api_key
         async def create_response():
             """
             OpenAI Responses API endpoint.
