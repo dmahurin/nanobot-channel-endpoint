@@ -57,7 +57,7 @@ HTML_PAGE = """<!doctype html>
   <script>
     let activeId = null;
     let sessions = JSON.parse(localStorage.getItem('endpoint_sessions') || '[]');
-    const endpointUrl = "/v1/responses/stream";
+    const endpointUrl = "/v1/responses";
 
     const addMsgToUI = (role, content, isError = false) => {
       const el = document.createElement('div');
@@ -252,7 +252,7 @@ class TestEndpointStreamingWebChat:
         def index():
             return render_template_string(HTML_PAGE)
 
-        @self.app.route('/v1/responses/stream', methods=['POST'])
+        @self.app.route('/v1/responses', methods=['POST'])
         def proxy_stream():
             """Proxy the streaming request to the actual EndpointChannel."""
             endpoint_url = getattr(self.config, "endpoint_url", "http://localhost:8080/v1/responses")
