@@ -1,10 +1,11 @@
 import uuid
 import time
 import threading
-import concurrent.futures
-from typing import Any, List, Dict, Optional
+import queue
+import json
+from typing import Any
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from werkzeug.serving import make_server
 from loguru import logger
 
@@ -24,6 +25,8 @@ class EndpointConfig(Base):
     host: str = "127.0.0.1"
     port: int = 8080
     allow_from: list[str] = Field(default_factory=lambda: ["*"])
+    streaming: bool = True
+    request_timeout: float = 60.0
 
 class EndpointChannel(BaseChannel):
     """
@@ -48,8 +51,52 @@ class EndpointChannel(BaseChannel):
         self.app = Flask(__name__)
         self._server = None
         self._server_thread = None
-        self._pending_responses: dict[str, concurrent.futures.Future] = {}
+        self._response_queues: dict[str, queue.SimpleQueue] = {}
+        self._responses_lock = threading.Lock()
         self._setup_routes()
+
+    def _register_queue(self, chat_id: str) -> queue.SimpleQueue:
+        q: queue.SimpleQueue = queue.SimpleQueue()
+        with self._responses_lock:
+            self._response_queues[chat_id] = q
+        return q
+
+    def _get_queue(self, chat_id: str) -> queue.SimpleQueue | None:
+        with self._responses_lock:
+            return self._response_queues.get(chat_id)
+
+    def _pop_queue(self, chat_id: str) -> None:
+        with self._responses_lock:
+            self._response_queues.pop(chat_id, None)
+
+    def _build_response_payload(self, chat_id: str, model: str, content: str, created_at: int) -> dict[str, Any]:
+        return {
+            "id": chat_id,
+            "object": "response",
+            "created_at": created_at,
+            "model": model,
+            "status": "completed",
+            "output": [
+                {
+                    "id": f"msg_{uuid.uuid4().hex}",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": content
+                        }
+                    ]
+                }
+            ],
+            "usage": {
+                "total_tokens": -1
+            }
+        }
+
+    def _sse_event(self, event: str, data: dict[str, Any]) -> str:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
     def _setup_routes(self) -> None:
         """Register Flask routes."""
@@ -134,8 +181,8 @@ class EndpointChannel(BaseChannel):
             if not self.is_allowed(sender_id):
                 return jsonify({"error": "Access denied"}), 403
 
-            future = concurrent.futures.Future()
-            self._pending_responses[chat_id] = future
+            stream = bool(data.get("stream", False))
+            q = self._register_queue(chat_id)
 
             try:
                 # Directly forward to the message bus via base class
@@ -147,46 +194,94 @@ class EndpointChannel(BaseChannel):
                         "http_request": True,
                         "instructions": instructions,
                         "store": data.get("store", True),
-                        "model": data.get("model")
+                        "model": data.get("model"),
+                        "stream": stream
                     }
                 )
 
-                # Wait for the response message (blocking the request thread is safe
-                # here because werkzeug is running in threaded mode)
-                timeout = getattr(self.config, "request_timeout", 60.0)
-                try:
-                    outbound_msg = future.result(timeout=timeout)
-                except concurrent.futures.TimeoutError:
-                    return jsonify({"error": "Response timeout"}), 504
+                timeout = float(getattr(self.config, "request_timeout", 60.0))
+                model = data.get("model", "agent-v1")
+                created_at = int(time.time())
 
-                # Construct Response object matching OpenAI spec
-                return jsonify({
-                    "id": chat_id,
-                    "object": "response",
-                    "created_at": int(time.time()),
-                    "model": data.get("model", "agent-v1"),
-                    "status": "completed",
-                    "output": [
-                        {
-                            "id": f"msg_{uuid.uuid4().hex}",
-                            "type": "message",
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [
+                if stream:
+                    def event_stream():
+                        buffer = ""
+                        try:
+                            yield self._sse_event(
+                                "response.created",
                                 {
-                                    "type": "text",
-                                    "text": outbound_msg.content
+                                    "id": chat_id,
+                                    "object": "response",
+                                    "created_at": created_at,
+                                    "model": model,
+                                    "status": "in_progress"
                                 }
-                            ]
-                        }
-                    ],
-                    "usage": {
-                        "total_tokens": -1
+                            )
+                            while True:
+                                try:
+                                    item = q.get(timeout=timeout)
+                                except queue.Empty:
+                                    yield self._sse_event("response.error", {"error": "Response timeout"})
+                                    break
+
+                                item_type = item.get("type")
+                                if item_type == "delta":
+                                    delta = item.get("delta", "")
+                                    buffer += delta
+                                    yield self._sse_event(
+                                        "response.output_text.delta",
+                                        {"delta": delta, "response_id": chat_id}
+                                    )
+                                elif item_type == "end":
+                                    meta = item.get("meta", {})
+                                    if meta.get("_resuming"):
+                                        continue
+                                    payload = self._build_response_payload(chat_id, model, buffer, created_at)
+                                    yield self._sse_event("response.completed", payload)
+                                    break
+                                elif item_type == "final":
+                                    outbound_msg = item.get("msg")
+                                    content_text = outbound_msg.content if outbound_msg else buffer
+                                    payload = self._build_response_payload(chat_id, model, content_text, created_at)
+                                    yield self._sse_event("response.completed", payload)
+                                    break
+                        finally:
+                            self._pop_queue(chat_id)
+
+                    headers = {
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no"
                     }
-                })
+                    return Response(stream_with_context(event_stream()), mimetype="text/event-stream", headers=headers)
+
+                # Non-streaming: aggregate deltas or await final message
+                buffer = ""
+                while True:
+                    try:
+                        item = q.get(timeout=timeout)
+                    except queue.Empty:
+                        return jsonify({"error": "Response timeout"}), 504
+
+                    item_type = item.get("type")
+                    if item_type == "delta":
+                        buffer += item.get("delta", "")
+                        continue
+                    if item_type == "end":
+                        meta = item.get("meta", {})
+                        if meta.get("_resuming"):
+                            continue
+                        payload = self._build_response_payload(chat_id, model, buffer, created_at)
+                        return jsonify(payload)
+                    if item_type == "final":
+                        outbound_msg = item.get("msg")
+                        content_text = outbound_msg.content if outbound_msg else buffer
+                        payload = self._build_response_payload(chat_id, model, content_text, created_at)
+                        return jsonify(payload)
 
             finally:
-                self._pending_responses.pop(chat_id, None)
+                if not stream:
+                    self._pop_queue(chat_id)
 
     async def start(self) -> None:
         """Start the Flask server in a background thread."""
@@ -210,10 +305,26 @@ class EndpointChannel(BaseChannel):
         logger.info("Endpoint channel stopped")
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Fulfill the interface by resolving the pending future."""
-        future = self._pending_responses.get(msg.chat_id)
-        if future and not future.done():
-            future.set_result(msg)
-            logger.debug(f"Resolved response for {msg.chat_id}")
+        """Fulfill the interface by delivering a final message to the queue."""
+        q = self._get_queue(msg.chat_id)
+        if q:
+            q.put_nowait({"type": "final", "msg": msg})
+            logger.debug(f"Enqueued final response for {msg.chat_id}")
         else:
             logger.warning(f"Received outbound message for unknown or expired chat_id: {msg.chat_id}")
+
+    async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
+        """Deliver a streaming chunk to the pending response queue."""
+        q = self._get_queue(chat_id)
+        if not q:
+            logger.warning(f"Received stream delta for unknown or expired chat_id: {chat_id}")
+            return
+
+        meta = metadata or {}
+        if meta.get("_stream_end"):
+            q.put_nowait({"type": "end", "meta": meta})
+            logger.debug(f"Enqueued stream end for {chat_id}")
+            return
+
+        q.put_nowait({"type": "delta", "delta": delta, "meta": meta})
+        logger.debug(f"Enqueued stream delta for {chat_id}")
