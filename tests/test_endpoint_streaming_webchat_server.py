@@ -267,9 +267,10 @@ class TestEndpointStreamingWebChat:
                     stream=True
                 )
 
-                def generate() -> Iterable[str]:
-                    for line in upstream.iter_lines(decode_unicode=True):
-                        yield f"{line}\n"
+                def generate():
+                    for chunk in upstream.iter_content(chunk_size=8192):
+                        if chunk:
+                            yield chunk
 
                 headers = {
                     "Cache-Control": "no-cache",
