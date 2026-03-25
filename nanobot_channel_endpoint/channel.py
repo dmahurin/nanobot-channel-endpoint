@@ -19,6 +19,54 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Base
 
+import re
+import base64
+import mimetypes
+from pathlib import Path
+
+def save_data_url(data_url: str, out_dir: str = ".", filename: str = "image") -> str:
+    # match data:[<mediatype>][;base64],<data>
+    m = re.match(r"data:(?P<mime>[^;,\s]+)?(?:;base64)?,(?P<data>.+)$", data_url, re.I)
+    if not m:
+        raise ValueError("Input is not a valid data URL")
+
+    mime = m.group("mime") or "application/octet-stream"
+    b64data = m.group("data")
+
+    try:
+        decoded = base64.b64decode(b64data, validate=True)
+    except Exception:
+        # fallback: try without validation (tolerant)
+        decoded = base64.b64decode(b64data)
+
+    # guess extension from MIME type
+    ext = mimetypes.guess_extension(mime.split(";")[0].lower()) or ""
+    # common override for image/png vs .png etc.
+    if not ext and mime.startswith("image/"):
+        ext = "." + mime.split("/", 1)[1]
+
+    out_path = Path(out_dir) / (filename + ext)
+
+    out_path.write_bytes(decoded)
+    return str(out_path)
+
+def file_to_data_url(filename: str) -> str:
+    """
+    Read a file and return a data URL like: data:<mime>;base64,<base64-data>
+    """
+    p = Path(filename)
+    if not p.is_file():
+        raise FileNotFoundError(f"No such file: {filename}")
+
+    mime, _ = mimetypes.guess_type(p.name)
+    if not mime:
+        mime = "application/octet-stream"
+
+    data = p.read_bytes()
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
 class EndpointConfig(Base):
     enabled: bool = False
     api_key: str = ""
@@ -69,8 +117,8 @@ class EndpointChannel(BaseChannel):
         with self._responses_lock:
             self._response_queues.pop(chat_id, None)
 
-    def _build_response_payload(self, chat_id: str, model: str, content: str, created_at: int) -> dict[str, Any]:
-        return {
+    def _build_response_payload(self, chat_id: str, model: str, content: str, created_at: int, urls: list[str] | None = None) -> dict[str, Any]:
+        payload = {
             "id": chat_id,
             "object": "response",
             "created_at": created_at,
@@ -94,6 +142,10 @@ class EndpointChannel(BaseChannel):
                 "total_tokens": -1
             }
         }
+        if urls:
+            content_list = payload["output"][0]["content"]
+            content_list.extend([{"type": "image_url", "image_url": {"url": url}} for url in urls])
+        return payload
 
     def _sse_event(self, event: str, data: dict[str, Any]) -> str:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -151,6 +203,7 @@ class EndpointChannel(BaseChannel):
             instructions = data.get("instructions", "")
 
             content = ""
+            images = []
             if isinstance(input_items, list):
                 # Extract text from the last user message item
                 for item in reversed(input_items):
@@ -158,6 +211,18 @@ class EndpointChannel(BaseChannel):
                         item_content = item.get("content")
                         if isinstance(item_content, list):
                             content = " ".join([c.get("text", "") for c in item_content if c.get("type") == "text"])
+                            images = [
+                                c.get("image_url").get("url")
+                                for c in item_content
+                                if c.get("type") == "image_url"
+                                and "image_url" in c
+                                and "url" in c.get("image_url")
+                            ]
+                            images = [
+                                save_data_url(url, filename=f"image_{i}")
+                                for i, url in enumerate(images)
+                                if url and url.startswith("data:")
+                            ]
                         elif isinstance(item_content, str):
                             content = item_content
                         break
@@ -190,6 +255,7 @@ class EndpointChannel(BaseChannel):
                     sender_id=sender_id,
                     chat_id=chat_id,
                     content=content,
+                    media=images,
                     metadata={
                         "http_request": True,
                         "instructions": instructions,
@@ -242,7 +308,8 @@ class EndpointChannel(BaseChannel):
                                 elif item_type == "final":
                                     outbound_msg = item.get("msg")
                                     content_text = outbound_msg.content if outbound_msg else buffer
-                                    payload = self._build_response_payload(chat_id, model, content_text, created_at)
+                                    urls = [file_to_data_url(file) for file in outbound_msg.media] if outbound_msg and outbound_msg.media else None
+                                    payload = self._build_response_payload(chat_id, model, content_text, created_at, urls=urls)
                                     yield self._sse_event("response.completed", payload)
                                     break
                         finally:
@@ -276,7 +343,8 @@ class EndpointChannel(BaseChannel):
                     if item_type == "final":
                         outbound_msg = item.get("msg")
                         content_text = outbound_msg.content if outbound_msg else buffer
-                        payload = self._build_response_payload(chat_id, model, content_text, created_at)
+                        urls = [file_to_data_url(file) for file in outbound_msg.media] if outbound_msg and outbound_msg.media else None
+                        payload = self._build_response_payload(chat_id, model, content_text, created_at, urls=urls)
                         return jsonify(payload)
 
             finally:
